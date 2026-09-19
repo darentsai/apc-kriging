@@ -1,0 +1,407 @@
+---
+title: "Age-Period-Cohort Kriging"
+subtitle: "Implementation Workflow"
+author: "Tsai, Dai-Rong"
+number-sections: true
+toc: true
+format:
+  html:
+    df-print: paged
+    embed-resources: true
+    code-link: true
+    grid:
+      margin-width: 300px
+---
+
+This manual provides a practical guide to **age-period-cohort (APC) Kriging** for
+spatiotemporal disease mapping. Prior to implementing the method, ensure that
+all required packages are installed and loaded.
+
+```{r}
+#| message: false
+#| warning: false
+
+library(stablemap)
+library(dplyr)     # tabular data manipulation
+library(sf)        # spatial object manipulation
+library(lme4)      # mixed-effects model fitting
+library(automap)   # automatic variogram fitting
+```
+
+::: {.callout-note appearance = "simple"}
+
+The `{stablemap}` R package we developed provides functions to perform Kriging interpolation
+and generate design matrices for APC models. It's available on GitHub:
+
+```{r}
+#| eval: false
+
+remotes::install_github("darentsai/stablemap")
+```
+
+:::
+
+## Import the shapefile to generate centroid and grid coordinates
+
+`{stablemap}` includes the township-level shapefile for the main island of Taiwan.
+We import the shapefile using `st_read()` from the `{sf}` package:
+
+```{r}
+#| output: false
+
+map <- st_read(dsn = system.file("extdata", "tw_map", package = "stablemap"),
+               layer = "TAIWAN_MAIN_ISLAND",
+               stringsAsFactors = FALSE)
+```
+
+- Subset the study region (57 administrative units in Chiayi and Tainan)
+
+```{r indent = "  "}
+map <- map |>
+  select(COUNTYCODE, TOWNCODE, TOWNENG) |>
+  filter(COUNTYCODE %in% c("67000","10010","10020"))
+```
+
+```{r}
+#| indent: "  "
+#| echo: false
+
+map
+```
+
+- Compute the centroid coordinate for each administrative unit
+
+```{r}
+#| indent: "  "
+#| warning: false
+
+unit_centr <- st_centroid(map)
+```
+
+- Create a regular grid, retaining the grid points falling within the boundary
+
+```{r}
+#| indent: "  "
+
+grid_all <- st_make_grid(map, cellsize = 0.01, what = "centers")
+grid <- grid_all[map]
+```
+
+- Overview
+
+```{r}
+#| indent: "  "
+#| fig-height: 4
+#| code-fold: true
+
+par(mai = c(0, 0, 0, 0))
+plot(st_geometry(map))
+points(grid, col = 3, cex = 0.1)
+points(unit_centr, col = 2, cex = 0.5)
+legend("right", legend = c("centroid", "grid"), bty = "n",
+       col = c(2, 3), pch = c(1, 16))
+```
+
+## Prepare the age-period-cohort data and design matrix
+
+The simulated age-period data are provided in <https://github.com/darentsai/apc-kriging>.
+Here we use `apc_example_2.csv` to demonstrate how APC Kriging can be used to identify
+space-time disease trends. The dataset contains the observed number of cases (`CASE`)
+and population size (`POP`) for each combination of
+
+- 57 administrative units
+- 5 calendar periods (1995-1999, ..., 2015-2019)
+- 9 age groups (40-44, ..., 80-84)
+
+It's recommended to sort the data sequentially by unit IDs (`TOWNCODE`),
+calendar periods (`PERIOD`), and then by age groups (`AGE`).
+
+```{r}
+dat <- read.csv("example/apc_example_2.csv", colClasses = c(TOWNCODE = "character")) |>
+  arrange(TOWNCODE, PERIOD, AGE)
+```
+
+::: {.panel-tabset}
+
+#### Preview (first unit) {.unnumbered .unlisted}
+
+```{r}
+head(dat, 9)
+```
+
+#### (last unit) {.unnumbered .unlisted}
+
+```{r}
+tail(dat, 9)
+```
+
+:::
+
+- Convert age and period to numeric indices and compute the corresponding cohort index
+
+```{r}
+#| indent: "  "
+
+dat <- dat |>
+  mutate(AGE = match(AGE, unique(AGE)),
+         PERIOD = match(PERIOD, unique(PERIOD)),
+         COHORT = PERIOD - AGE + max(AGE))
+```
+
+- Construct the APC design matrix for each unit, and bind them together
+
+```{r}
+#| indent: "  "
+
+dmat <- lapply(unique(dat$TOWNCODE), \(x) {
+    datx <- subset(dat, TOWNCODE == x)
+    with(datx, apc_dmat(AGE, PERIOD, COHORT))
+  }) |>
+  do.call(what = rbind)
+
+colnames(dmat) <- c("Int", "A", "C",
+                    paste0("A_curv", seq_len(max(dat$AGE) - 2)),
+                    paste0("P_curv", seq_len(max(dat$PERIOD) - 2)),
+                    paste0("C_curv", seq_len(max(dat$COHORT) - 2)))
+```
+
+  Suppose there are $n_A$ age groups, $n_P$ calendar periods, and $n_C$ birth cohorts.
+  The columns of the design matrix represent:
+  
+  - intercept
+  - centered ages
+  - centered cohorts
+  - $n_A - 2$ age curvatures
+  - $n_P - 2$ period curvatures
+  - $n_C - 2$ cohort curvatures
+  
+  in that order. In this case, we obtain 7 age curvatures, 3 period curvatures,
+  and 11 cohort curvatures.
+
+- Combine the design matrix with unit IDs, population sizes, and case counts to construct the final data frame for model fitting
+
+```{r}
+#| indent: "  "
+
+apc_dat <- cbind(dat[c("TOWNCODE", "CASE", "POP")], dmat)
+```
+
+## Fit the APC Kriging model
+
+- Fit a mixed-effects APC model with Poisson likelihood
+
+```{r}
+#| indent: "  "
+
+apc_mod <- glmer(
+  CASE ~ A + C +
+    A_curv1 + A_curv2 + A_curv3 + A_curv4 + A_curv5 + A_curv6 + A_curv7 +
+    P_curv1 + P_curv2 + P_curv3 +
+    C_curv1 + C_curv2 + C_curv3 + C_curv4 + C_curv5 + C_curv6 +
+    C_curv7 + C_curv8 + C_curv9 + C_curv10 + C_curv11 +
+    (1 + A + C | TOWNCODE),
+  data = apc_dat, family = "poisson", offset = log(POP),
+  control = glmerControl(optimizer = "nloptwrap", calc.derivs = FALSE)
+)
+```
+
+- Extract the following components from the APC model:
+  
+  1. Fixed effects
+  
+```{r}
+#| indent: "     "
+
+fix_ef <- fixef(apc_mod)
+```
+  
+  2. Random effects for intercept, age, and cohort
+  
+```{r}
+#| indent: "     "
+
+ran_ef <- ranef(apc_mod)$TOWNCODE
+colnames(ran_ef) <- c("ran_int", "ran_age", "ran_coh")
+```
+  
+  3. Posterior variances of the random effects
+  
+```{r}
+#| indent: "     "
+
+ran_ef_var <- t(apply(attr(ran_ef, "postVar"), 3, diag))
+colnames(ran_ef_var) <- c("var_int", "var_age", "var_coh")
+```
+
+- Merge the three random effects and their posterior variances into the unit centroid data
+
+```{r}
+#| indent: "  "
+
+spdat <- left_join(unit_centr,
+                   data.frame(TOWNCODE = rownames(ran_ef), ran_ef, ran_ef_var),
+                   by = "TOWNCODE")
+```
+
+- Fit variogram models for the random effects
+
+```{r}
+#| indent: "  "
+
+vgm_int <- autofitVariogram(ran_int ~ 1, as_Spatial(spdat))$var_model
+vgm_age <- autofitVariogram(ran_age ~ 1, as_Spatial(spdat))$var_model
+vgm_coh <- autofitVariogram(ran_coh ~ 1, as_Spatial(spdat))$var_model
+```
+
+- Interpolate random effects to the grid using stabilized kriging
+
+```{r}
+#| indent: "  "
+
+krige_int <- krige_sp(ran_int ~ 1, spdat, model = vgm_int, errorVar = var_int)
+krige_age <- krige_sp(ran_age ~ 1, spdat, model = vgm_age, errorVar = var_age)
+krige_coh <- krige_sp(ran_coh ~ 1, spdat, model = vgm_coh, errorVar = var_coh)
+
+ran_ef_krige <- cbind(predict(krige_int, grid)$var1.pred,
+                      predict(krige_age, grid)$var1.pred,
+                      predict(krige_coh, grid)$var1.pred)
+```
+
+## Prediction
+
+Prediction from the fitted model requires first generating the design matrix
+for the specified cells. Here, we predict all 9×13=117 age-cohort cells.
+
+- Create the design matrix for the target age-cohort cells
+
+```{r}
+#| indent: "  "
+
+A_curv <- apc_dat |>
+  select(A, contains("A_curv")) |>
+  filter(!duplicated(A))
+
+P_curv <- apc_dat |>
+  mutate(P = A + C) |>
+  select(P, contains("P_curv")) |>
+  filter(!duplicated(P))
+
+C_curv <- apc_dat |>
+  select(C, contains("C_curv")) |>
+  filter(!duplicated(C))
+
+dmat_new <- expand.grid(Int = 1, A = A_curv$A, C = C_curv$C) |>
+  mutate(P = A + C) |>
+  left_join(A_curv, by = "A") |>
+  left_join(P_curv, by = "P") |>
+  left_join(C_curv, by = "C") |>
+  arrange(A, C) |>
+  select(-P)
+```
+  
+  Note that some age-cohort cells correspond to unobserved periods, producing missing
+  period curvatures. We can impute them with the expected value of the curvatures, namely 0.
+  
+```{r}
+#| indent: "  "
+
+dmat_new[is.na(dmat_new)] <- 0
+```
+
+- Add the kriged random effects to their respective fixed effects
+  to obtain grid-level coefficients
+
+```{r}
+#| indent: "  "
+
+grid_coef <- matrix(fix_ef, nrow = nrow(ran_ef_krige), ncol = length(fix_ef), byrow = TRUE)
+grid_coef[, 1:3] <- grid_coef[, 1:3] + ran_ef_krige
+```
+
+- Multiply the design matrix by the corresponding coefficients, exponentiating the result
+  to yield predicted disease rates
+
+```{r}
+#| indent: "  "
+
+pred <- exp(as.matrix(dmat_new) %*% t(grid_coef)) * 1e5
+```
+
+The final output is a 117x3769 matrix:
+disease rates for 117 age-cohort cells across 3,769 grid points.
+
+## Visualization
+
+We display the predicted disease rates accompanied by the raw observed rates
+at the median age group (60-64 years; centered age index being 0)
+across 1925-1965 birth cohorts (centered cohort index from -4 to 4).
+Note that only cases from the 1935-1955 birth cohorts are available within this age group.
+
+```{r}
+#| warning: false
+#| fig-width: 10
+#| fig-height: 4.3
+#| column: page
+#| code-fold: true
+
+library(ggplot2)
+library(patchwork)
+
+# log-scale colorbar
+rate_cutpoint <- c(-Inf, round(exp(seq(log(70), log(270), length = 20))), Inf)
+
+cohort_ind <- -4:4
+predx <- pred[dmat_new$A == 0 & dmat_new$C %in% cohort_ind, ]
+rownames(predx) <- cohort_ind
+
+dat_pred <- cbind(st_coordinates(grid), t(predx)) |>
+  as.data.frame() |>
+  tidyr::pivot_longer(all_of(as.character(cohort_ind)),
+                      names_to = "cohort", values_to = "rate",
+                      names_transform = as.integer)
+
+dat_obs <- apc_dat |>
+  filter(A == 0) |>
+  select(TOWNCODE, cohort = C, CASE, POP) |>
+  tidyr::complete(TOWNCODE, cohort = cohort_ind) |>
+  mutate(rate = (CASE / POP) * 1e5,
+         level = cut(rate, rate_cutpoint)) |>
+  left_join(map, by = "TOWNCODE") |>
+  st_sf()
+
+shared_config <- list(
+  facet_grid(~ cohort, labeller = labeller(cohort = \(t) paste(as.integer(t)*5 + 1945, "cohort"))),
+  scale_fill_discrete(name = "Rate (per 100,000 population)",
+                      palette = \(n) hcl.colors(n, "Rocket"),
+                      guide = guide_colorsteps(frame.colour = "black", ticks.colour = "black",
+                                               frame.linewidth = 0.2, ticks.linewidth = 0.2),
+                      na.value = "grey85", drop = FALSE),
+  scale_x_continuous(labels = \(x) sprintf("%.1f", x), breaks = seq(120.1, 120.7, by = 0.3)),
+  scale_y_continuous(labels = \(x) sprintf("%.1f", x), breaks = seq(23, 23.6, by = 0.2)),
+  theme_bw(base_family = "serif")
+)
+
+p1 <- ggplot(dat_obs) +
+  geom_sf(aes(fill = level), linewidth = 0.2, colour = "black") +
+  shared_config +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+  labs(title = "(A) Observed disease rates")
+
+p2 <- ggplot(dat_pred, aes(x = X, y = Y)) +
+  geom_contour_filled(aes(z = rate), breaks = rate_cutpoint,
+                      linewidth = 0.2, colour = "black") +
+  coord_sf(crs = st_crs(map)) +
+  shared_config +
+  theme(strip.background = element_blank(), strip.text = element_blank()) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)",
+       title = "(B) Predicted rates from APC Kriging")
+
+(p1 / p2 + plot_layout(guides = "collect")) &
+  theme(legend.position = "bottom",
+        legend.title.position = "bottom",
+        legend.title = element_text(hjust = 0.5),
+        legend.key.width = unit(30, "mm"),
+        legend.key.height = unit(2.5, "mm"),
+        axis.title.y = element_text(hjust = 6),
+        panel.spacing.x = unit(-1, "mm"))
+```
